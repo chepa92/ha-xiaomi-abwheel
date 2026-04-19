@@ -1,0 +1,17 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Xiaomi Ab Wheel",
+        "description": "Enter the BLE MAC address and Mi token (24 hex chars) from Xiaomi cloud.",
+        "data": {
+          "mac": "MAC Address",
+          "token": "Token (hex)"
+        }
+      }
+    },
+    "error": {
+      "invalid_token": "Token must be 24 hex characters (12 bytes)"
+    }
+  }
+}
