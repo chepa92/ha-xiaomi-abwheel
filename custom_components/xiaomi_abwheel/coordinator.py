@@ -369,5 +369,6 @@ class AbWheelCoordinator(DataUpdateCoordinator):
             return 0
 
     async def async_shutdown(self):
-        """Disconnect on HA shutdown."""
+        """Stop polling and disconnect on unload/shutdown."""
+        await super().async_shutdown()
         await self.device.disconnect()

@@ -5,6 +5,7 @@ import logging
 import secrets
 import struct
 import time
+from collections import deque
 
 from bleak import BleakClient
 from bleak_retry_connector import establish_connection
@@ -101,7 +102,7 @@ class SpecBuilder:
         self.serial = 0
 
     def _header(self, opcode: int, body: bytes) -> bytes:
-        self.serial += 1
+        self.serial = (self.serial + 1) & 0xFFFF
         total = 5 + len(body)
         fc = total | (SPEC_VERSION << 12)
         return struct.pack("<HHB", fc, self.serial, opcode) + body
@@ -317,6 +318,11 @@ class AbWheelDevice:
         self._connected = False
         self._event_callback = None
         self._event_task: asyncio.Task | None = None
+        # Serialises request/response exchanges and event reads on 0x001B so
+        # the background listener can't steal a command's response.
+        self._io_lock = asyncio.Lock()
+        # Events (opcode 0x07) received while waiting for a command response.
+        self._event_backlog: deque[dict] = deque()
         self.firmware: str = ""
         self.serial: str = ""
 
@@ -340,8 +346,16 @@ class AbWheelDevice:
     def _on_upnp(self, _s, d):
         self._upnp_q.put_nowait(bytes(d))
 
+    def _drain_queues(self):
+        """Drop anything left over from a previous connection/auth attempt."""
+        for q in (self._w_q, self._n_q, self._avdtp_q, self._upnp_q):
+            while not q.empty():
+                q.get_nowait()
+        self._event_backlog.clear()
+
     async def connect(self) -> bool:
         """Connect, authenticate, and initialize."""
+        self._drain_queues()
         try:
             if self._ble_device is not None:
                 self._client = await establish_connection(
@@ -485,23 +499,36 @@ class AbWheelDevice:
         return keys
 
     async def _send_and_recv(self, pkt: bytes) -> dict | None:
-        """Encrypt, send via parcel on 0x001A, receive response from 0x001B."""
-        enc = self._cipher.encrypt(pkt)
-        ok = await _parcel_send(self._client, self._w_q, CHAR_SPEC_W, enc)
-        if not ok:
-            return None
-        raw = await _parcel_receive(self._client, self._n_q, CHAR_SPEC_N)
-        pt = self._cipher.decrypt(raw)
-        if pt is None:
-            return None
-        return parse_spec_packet(pt)
+        """Encrypt, send via parcel on 0x001A, receive response from 0x001B.
+
+        Events that arrive before the response are queued in the backlog so
+        the event listener / _recv_event can still process them.
+        """
+        async with self._io_lock:
+            enc = self._cipher.encrypt(pkt)
+            ok = await _parcel_send(self._client, self._w_q, CHAR_SPEC_W, enc)
+            if not ok:
+                return None
+            while True:
+                raw = await _parcel_receive(self._client, self._n_q, CHAR_SPEC_N)
+                pt = self._cipher.decrypt(raw)
+                if pt is None:
+                    return None
+                resp = parse_spec_packet(pt)
+                if resp["opcode"] == 0x07:
+                    self._event_backlog.append(resp)
+                    continue
+                return resp
 
     async def _recv_event(self, timeout: float = 15) -> dict | None:
-        raw = await _parcel_receive(self._client, self._n_q, CHAR_SPEC_N, timeout=timeout)
-        pt = self._cipher.decrypt(raw)
-        if pt is None:
-            return None
-        return parse_spec_packet(pt)
+        if self._event_backlog:
+            return self._event_backlog.popleft()
+        async with self._io_lock:
+            raw = await _parcel_receive(self._client, self._n_q, CHAR_SPEC_N, timeout=timeout)
+            pt = self._cipher.decrypt(raw)
+            if pt is None:
+                return None
+            return parse_spec_packet(pt)
 
     # ── Public commands ───────────────────────────────────────────────────
 
@@ -648,7 +675,9 @@ class AbWheelDevice:
         """Listen for real-time events. Calls event_callback(siid, eiid, params)."""
         while self.connected:
             try:
-                evt = await self._recv_event(timeout=5)
+                # Short timeout: the lock is released between reads so commands
+                # (e.g. start_exercise) wait at most ~1s for their turn.
+                evt = await self._recv_event(timeout=1)
                 if evt and evt["opcode"] == 0x07:
                     siid, eiid, params = parse_event(evt["body"], evt["version"])
                     if self._event_callback:
